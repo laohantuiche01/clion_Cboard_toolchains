@@ -1,0 +1,15 @@
+CheckPlugin263:
+PASS: actual CLion 263 compatibility checker: incompatible=false
+PASS: linked 40 plugin classes against installed IDE libraries
+
+AlignmentCheck:
+PASS: late channel, missing samples, ring wrap, and clear/restart alignment
+
+WindowAndSelectionCheck:
+PASS: streaming range, zoom, history browsing, and channel visibility/alignment
+
+StreamingCheck:
+PASS: actual PlotCanvas streams the latest window, resizes it, and includes only visible curves
+
+SamplingSelectionCheck:
+PASS: real Telnet sampler switches selected variables, parses float replies, and keeps removed curves absent (in-memory I/O)

@@ -1,0 +1,5 @@
+# 本地构建的插件安装包
+*.zip
+
+# Claude Code 本地配置
+.claude/

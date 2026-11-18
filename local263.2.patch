@@ -333,6 +333,15 @@
          // RTT 设置
 --- a/src/main/kotlin/com/github/waveformplotter/WaveformPanel.kt
 +++ b/src/main/kotlin/com/github/waveformplotter/WaveformPanel.kt
+@@ -39,7 +39,7 @@
+         SwingUtilities.invokeLater { updateChannelValues(); updateStatusBar() }
+     }
+     private val sessionListener = DebugSessionListener(project, collector) { active ->
+-        SwingUtilities.invokeLater { updateSessionState(active) }
++        onUiThread { updateSessionState(active) }
+     }
+ 
+     // 控制按钮
 @@ -58,6 +58,10 @@
          toolTipText = "Sampling frequency (Hz) — Telnet mode only"
      }
@@ -363,7 +372,7 @@
 +            liveWatchService.stopLiveWatch()
 +            liveWatchService.clearResolvedEntries()
 +            liveWatchService.elfResolver.clear()
-+            SwingUtilities.invokeLater {
++            onUiThread {
 +                resolutionGeneration++
 +                resolvingVariables = false
 +                plotRequested = false
@@ -399,7 +408,19 @@
                  }
              }
          }
-@@ -179,6 +201,21 @@
+@@ -151,6 +173,11 @@
+         sessionListener.onSessionResumed = { _ ->
+             // 采集在 timer 中自动进行，无需额外操作
+         }
++    }
++
++    private fun onUiThread(action: () -> Unit) {
++        if (SwingUtilities.isEventDispatchThread()) action()
++        else SwingUtilities.invokeLater { action() }
+     }
+ 
+     private fun buildUI() {
+@@ -179,6 +206,21 @@
          controlBar.add(timeModeBtn)
          controlBar.add(fftModeBtn)
          controlBar.add(timeUnitBtn)
@@ -421,7 +442,7 @@
          updateModeButtons()
  
          // --- Live Watch 控件 ---
-@@ -245,21 +282,27 @@
+@@ -245,21 +287,27 @@
          val name = varField.text.trim()
          if (name.isEmpty()) return
          if (channelCheckboxes.containsKey(name)) {
@@ -453,7 +474,7 @@
      }
  
      private fun addChannelCheckbox(name: String, checked: Boolean) {
-@@ -272,11 +315,18 @@
+@@ -272,11 +320,18 @@
          val channel = dataBuffer.getChannels().find { it.name == name } ?: return
          val color = channel.color
  
@@ -474,7 +495,7 @@
          }
  
          // 实时数值标签
-@@ -286,13 +336,18 @@
+@@ -286,13 +341,18 @@
          }
  
          cb.addActionListener {
@@ -500,7 +521,7 @@
          // 右键删除
          val rightClickListener = object : java.awt.event.MouseAdapter() {
              override fun mouseClicked(e: java.awt.event.MouseEvent) {
-@@ -302,11 +357,14 @@
+@@ -302,11 +362,14 @@
              }
          }
          cb.addMouseListener(rightClickListener)
@@ -515,7 +536,7 @@
  
          channelCheckboxes[name] = cb
          channelValueLabels[name] = valueLabel
-@@ -315,6 +373,7 @@
+@@ -315,6 +378,7 @@
          val itemPanel = JPanel(FlowLayout(FlowLayout.LEFT, 0, 0)).apply {
              isOpaque = false
              add(cb)
@@ -523,7 +544,7 @@
              add(valueLabel)
          }
          channelCheckPanel.add(itemPanel)
-@@ -322,8 +381,26 @@
+@@ -322,8 +386,26 @@
          channelCheckPanel.repaint()
      }
  
@@ -550,7 +571,7 @@
          dataBuffer.removeChannel(name)
          channelCheckboxes.remove(name)
          channelValueLabels.remove(name)
-@@ -331,7 +408,7 @@
+@@ -331,7 +413,7 @@
          val components = channelCheckPanel.components.toList()
          for (comp in components) {
              if (comp is JPanel) {
@@ -559,7 +580,7 @@
                  if (hasTarget) {
                      channelCheckPanel.remove(comp)
                      break
-@@ -340,6 +417,7 @@
+@@ -340,6 +422,7 @@
          }
          channelCheckPanel.revalidate()
          channelCheckPanel.repaint()
@@ -567,7 +588,7 @@
          saveConfig()
      }
  
-@@ -391,6 +469,8 @@
+@@ -391,6 +474,8 @@
      // ── Telnet 模式 ──
  
      private fun startLiveWatch() {
@@ -576,7 +597,7 @@
          val session = sessionListener.getCurrentSession()
          if (session == null) {
              liveWatchBtn.foreground = colorError
-@@ -400,6 +480,7 @@
+@@ -400,6 +485,7 @@
          }
  
          val trackedVars = collector.trackedVariables.toList()
@@ -584,7 +605,7 @@
          if (trackedVars.isEmpty()) {
              liveStatusLabel.text = "No variables selected  "
              liveStatusLabel.foreground = colorError
-@@ -409,11 +490,6 @@
+@@ -409,11 +495,6 @@
          val freq = freqSpinner.value as Int
          val config = WaveformConfigService.getInstance(project)
          val port = config.state.telnetPort
@@ -596,7 +617,7 @@
  
          // 1. 先尝试 ELF 符号表解析（无需暂停 MCU）
          val elfResolved = if (liveWatchService.elfResolver.isLoaded()) {
-@@ -429,10 +505,27 @@
+@@ -429,10 +510,27 @@
              log.info("All ${trackedVars.size} variables resolved via ELF (no pause needed)")
              launchLiveWatch(port, freq)
          } else {
@@ -626,7 +647,7 @@
                      if (total == 0) {
                          liveWatchBtn.text = "\u25B6 Live"
                          liveWatchBtn.isEnabled = true
-@@ -448,6 +541,7 @@
+@@ -448,6 +546,7 @@
      }
  
      private fun launchLiveWatch(port: Int, freq: Int) {
@@ -634,7 +655,7 @@
          liveWatchService.startLiveWatch(port, freq)
  
          if (liveWatchService.lastError != null) {
-@@ -468,12 +562,16 @@
+@@ -468,12 +567,16 @@
      }
  
      private fun stopLiveWatch() {
@@ -651,7 +672,7 @@
      }
  
      // ── RTT 模式 ──
-@@ -595,7 +693,8 @@
+@@ -595,7 +698,8 @@
      private fun clearAll() {
          dataBuffer.clearAll()
          collector.resetSampleCount()
@@ -661,7 +682,7 @@
          plotCanvas.resetView()
          plotCanvas.repaint()
          updateStatusBar()
-@@ -654,7 +753,7 @@
+@@ -654,7 +758,7 @@
          else
              JBColor(Color(0xB71C1C), Color(0xEF9A9A))
  
@@ -670,7 +691,7 @@
              stopLiveWatch()
          }
          // RTT 不依赖 debug session，不停止
-@@ -667,6 +766,10 @@
+@@ -667,6 +771,10 @@
      private fun updateChannelValues() {
          val entries = liveWatchService.getResolvedEntries()
          for ((name, label) in channelValueLabels) {
@@ -681,7 +702,7 @@
              val ch = dataBuffer.getChannels().find { it.name == name }
              if (ch != null && ch.size > 0) {
                  val lastValue = ch.get(ch.size - 1)
-@@ -692,11 +795,13 @@
+@@ -692,11 +800,13 @@
      }
  
      private fun saveConfig() {
@@ -695,7 +716,7 @@
          s.dataSource = dataSourceCombo.selectedItem as String
          s.fontSize = plotCanvas.fontSize
          s.lineWidth = plotCanvas.lineWidth
-@@ -704,21 +809,28 @@
+@@ -704,21 +814,28 @@
      }
  
      private fun restoreConfig() {

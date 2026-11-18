@@ -13,3 +13,6 @@ PASS: actual PlotCanvas streams the latest window, resizes it, and includes only
 
 SamplingSelectionCheck:
 PASS: real Telnet sampler switches selected variables, parses float replies, and keeps removed curves absent (in-memory I/O)
+
+PanelInteractionCheckKt:
+PASS: actual WaveformPanel attaches to Debug, restores settings, plots on name click, hides on uncheck, and saves window changes

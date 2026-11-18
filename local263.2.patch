@@ -1,0 +1,773 @@
+--- a/src/main/kotlin/com/github/waveformplotter/AddToPlotterAction.kt
++++ b/src/main/kotlin/com/github/waveformplotter/AddToPlotterAction.kt
+@@ -32,8 +32,7 @@
+ 
+         // 获取或激活 WaveformPanel
+         SwingUtilities.invokeLater {
+-            val panel = WaveformToolWindowFactory.getPanel(project) ?: return@invokeLater
+-            panel.addVariableByName(selectedText)
++            WaveformToolWindowFactory.withPanel(project) { it.addVariableByName(selectedText) }
+         }
+     }
+ }
+--- a/src/main/kotlin/com/github/waveformplotter/DataBuffer.kt
++++ b/src/main/kotlin/com/github/waveformplotter/DataBuffer.kt
+@@ -10,6 +10,8 @@
+     val color: Color,
+     private val capacity: Int = DEFAULT_CAPACITY
+ ) {
++    @Volatile
++    var visible = true
+     private val data = DoubleArray(capacity)
+     private var head = 0   // 下一个写入位置
+     var size = 0           // 当前有效数据量
+@@ -67,6 +69,9 @@
+             if (channels.any { it.name == name }) return null
+             val color = COLORS[channels.size % COLORS.size]
+             val ch = ChannelData(name, color)
++            // A late channel has no values for existing frames. Keep its indices
++            // aligned with the shared timestamp ring instead of shifting it left.
++            repeat(tsSize) { ch.push(Double.NaN) }
+             channels.add(ch)
+             return ch
+         }
+@@ -78,6 +83,16 @@
+ 
+     fun getChannels(): List<ChannelData> = synchronized(lock) { channels.toList() }
+ 
++    fun setChannelVisible(name: String, visible: Boolean) {
++        synchronized(lock) {
++            val channel = channels.find { it.name == name } ?: return
++            if (channel.visible != visible) {
++                channel.visible = visible
++                version++
++            }
++        }
++    }
++
+     fun pushAll(values: Map<String, Double>, timestampNs: Long = System.nanoTime()) {
+         synchronized(lock) {
+             if (tsSize == 0) baseTimestampNs = timestampNs
+@@ -85,8 +100,9 @@
+             tsHead = (tsHead + 1) % timestamps.size
+             if (tsSize < timestamps.size) tsSize++
+             for (ch in channels) {
+-                val v = values[ch.name]
+-                if (v != null) ch.push(v)
++                // Every channel advances once per frame, including failed reads
++                // and channels that are not included in this sample.
++                ch.push(values[ch.name] ?: Double.NaN)
+             }
+             version++
+         }
+--- a/src/main/kotlin/com/github/waveformplotter/DebugSessionListener.kt
++++ b/src/main/kotlin/com/github/waveformplotter/DebugSessionListener.kt
+@@ -24,6 +24,9 @@
+     private var currentSession: XDebugSession? = null
+     private var sessionListener: XDebugSessionListener? = null
+     private var busConnection: MessageBusConnection? = null
++
++    /** Called before a new session can populate cached addresses or samples. */
++    var onSessionAttached: (() -> Unit)? = null
+ 
+     /** Debug 会话启动时回调（首次暂停，用于 ELF 解析等初始化） */
+     var onSessionStarted: ((XDebugSession) -> Unit)? = null
+@@ -69,6 +72,7 @@
+ 
+     private fun attachToSession(session: XDebugSession) {
+         detachFromSession()
++        onSessionAttached?.invoke()
+         currentSession = session
+ 
+         firstPause = true
+--- a/src/main/kotlin/com/github/waveformplotter/LiveWatchService.kt
++++ b/src/main/kotlin/com/github/waveformplotter/LiveWatchService.kt
+@@ -32,6 +32,16 @@
+ 
+     /** 已解析的变量 → 地址/类型映射 */
+     private val watchEntries = ConcurrentHashMap<String, WatchEntry>()
++    @Volatile
++    private var trackedNames: Set<String>? = null
++
++    fun setTrackedVariables(names: Collection<String>) {
++        trackedNames = names.toSet()
++    }
++
++    fun removeVariable(name: String) {
++        watchEntries.remove(name)
++    }
+ 
+     /** ELF 符号解析器（无暂停方案） */
+     val elfResolver = ElfSymbolResolver()
+@@ -306,7 +316,8 @@
+      * 效果: N 个变量从 N*RTT 降到 1*RTT，采样率提升 N 倍
+      */
+     private fun sample() {
+-        val entries = watchEntries.values.toList()
++        val selected = trackedNames
++        val entries = watchEntries.values.filter { selected == null || it.name in selected }
+         if (entries.isEmpty()) return
+ 
+         try {
+@@ -328,11 +339,6 @@
+             }
+ 
+             if (values.isNotEmpty()) {
+-                for (name in values.keys) {
+-                    if (dataBuffer.getChannels().none { it.name == name }) {
+-                        dataBuffer.addChannel(name)
+-                    }
+-                }
+                 dataBuffer.pushAll(values, System.nanoTime())
+                 sampleCount++
+                 onDataCollected()
+--- a/src/main/kotlin/com/github/waveformplotter/PlotCanvas.kt
++++ b/src/main/kotlin/com/github/waveformplotter/PlotCanvas.kt
+@@ -27,8 +27,18 @@
+     // 时域 X 轴（真实时间）
+     private var xOffsetSec = 0.0       // 可见窗口左边缘时间（秒，相对 t=0）
+     private var xScaleSPP = 0.001      // seconds-per-pixel（每像素多少秒）
+-    private var autoTrack = true       // 自动追踪最新数据（latest at right edge）
+-    private var userZoomed = false     // 用户是否手动缩放过（区分 auto-fit 和 sliding window）
++    private val timeWindow = StreamingTimeWindow()
++    var onWindowSecondsChanged: ((Double) -> Unit)? = null
++    var windowSeconds: Double
++        get() = timeWindow.durationSeconds
++        set(value) {
++            timeWindow.setDuration(value)
++            timeWindow.followLatest()
++            repaint()
++        }
++
++    private fun latestTimeSeconds(): Double = if (dataBuffer.tsSize > 0)
++        dataBuffer.getTimeSeconds(dataBuffer.tsSize - 1) else 0.0
+ 
+     // FFT X 轴（保持原样，样本序号式）
+     private var fftXScale = 1.0
+@@ -150,14 +160,7 @@
+             override fun mouseClicked(e: MouseEvent) {
+                 if (e.button == MouseEvent.BUTTON3) {
+                     // 右键：重置视图 + 恢复自动追踪
+-                    yScale = 1.0
+-                    yOffset = 0.0
+-                    xScaleSPP = 0.001
+-                    xOffsetSec = 0.0
+-                    autoTrack = true
+-                    userZoomed = false
+-                    fftXScale = 1.0
+-                    fftXOffset = 0
++                    resetView()
+                     repaint()
+                 }
+             }
+@@ -173,7 +176,7 @@
+                     if (displayMode == DisplayMode.TIME) {
+                         // 时域拖拽：像素差 × seconds-per-pixel
+                         xOffsetSec = dragStartXOffsetSec - dx * xScaleSPP
+-                        if (xOffsetSec < 0) xOffsetSec = 0.0
++                        timeWindow.panTo(xOffsetSec)
+                     } else {
+                         // FFT 拖拽：保持原逻辑
+                         val maxBins = fftCache.firstOrNull()?.magnitudes?.size ?: 0
+@@ -208,18 +211,12 @@
+                 val factor = if (e.wheelRotation < 0) 1.15 else 1.0 / 1.15
+                 if (e.isShiftDown) {
+                     if (displayMode == DisplayMode.TIME) {
+-                        // Shift+滚轮：缩放时间轴，保持 autoTrack（滑动窗口模式）
++                        // Shift+滚轮：调整流式窗口时长，或缩放手动查看的历史。
+                         val zoomFactor = if (e.wheelRotation < 0) 1.0 / 1.2 else 1.2
+-                        if (!autoTrack) {
+-                            // 手动模式：以鼠标位置为锚点缩放
+-                            val mouseRelPx = (e.x - margin.left).toDouble()
+-                            val mouseTime = xOffsetSec + mouseRelPx * xScaleSPP
+-                            xScaleSPP = (xScaleSPP * zoomFactor).coerceIn(1e-9, 100.0)
+-                            xOffsetSec = (mouseTime - mouseRelPx * xScaleSPP).coerceAtLeast(0.0)
+-                        } else {
+-                            xScaleSPP = (xScaleSPP * zoomFactor).coerceIn(1e-9, 100.0)
+-                        }
+-                        userZoomed = true
++                        val plotW = (width - margin.left - margin.right).coerceAtLeast(1)
++                        val fraction = (e.x - margin.left).toDouble() / plotW
++                        timeWindow.zoomBy(zoomFactor, fraction, latestTimeSeconds())
++                        onWindowSecondsChanged?.invoke(timeWindow.durationSeconds)
+                     } else {
+                         // FFT 模式保持原逻辑
+                         fftXScale = (fftXScale * factor).coerceIn(0.1, 100.0)
+@@ -253,8 +250,7 @@
+     fun resetView() {
+         xOffsetSec = 0.0
+         xScaleSPP = 0.001
+-        autoTrack = true
+-        userZoomed = false
++        timeWindow.followLatest()
+         yScale = 1.0
+         yOffset = 0.0
+         fftXScale = 1.0
+@@ -275,7 +271,7 @@
+         val plotH = height - margin.top - margin.bottom
+         if (plotW <= 0 || plotH <= 0) return
+ 
+-        val channels = dataBuffer.getChannels()
++        val channels = dataBuffer.getChannels().filter { it.visible }
+         if (channels.isEmpty()) {
+             drawEmptyHint(g2)
+             onStatusUpdate?.invoke(0, "N/A")
+@@ -298,21 +294,11 @@
+         g2: Graphics2D, plotW: Int, plotH: Int,
+         channels: List<ChannelData>, maxPoints: Int
+     ) {
+-        // 自动追踪
+-        if (autoTrack && dataBuffer.tsSize > 1) {
+-            val totalDuration = dataBuffer.getTimeSeconds(dataBuffer.tsSize - 1)
+-            if (totalDuration > 0) {
+-                if (!userZoomed) {
+-                    // 未手动缩放：auto-fit 所有数据
+-                    xScaleSPP = totalDuration * 1.05 / plotW
+-                    xOffsetSec = 0.0
+-                } else {
+-                    // 手动缩放过：sliding window，最新数据在右边缘
+-                    val visibleDuration = xScaleSPP * plotW
+-                    xOffsetSec = (totalDuration - visibleDuration * 0.95).coerceAtLeast(0.0)
+-                }
+-            }
+-        }
++        // Stream a fixed-duration window; historical points no longer shrink
++        // the whole recording into the visible area as acquisition continues.
++        val range = timeWindow.rangeAt(latestTimeSeconds())
++        xOffsetSec = range.startSeconds
++        xScaleSPP = timeWindow.durationSeconds / plotW
+ 
+         // 时间范围（秒）
+         val visibleDuration = xScaleSPP * plotW
+@@ -711,7 +697,7 @@
+     private fun drawEmptyHint(g2: Graphics2D) {
+         g2.color = textColor
+         g2.font = fontHint
+-        val msg = "Select variables and start recording to see waveforms"
++        val msg = "Start Debug, then click a variable name to plot"
+         val fm = g2.fontMetrics
+         g2.drawString(msg, (width - fm.stringWidth(msg)) / 2, height / 2)
+     }
+--- /dev/null
++++ b/src/main/kotlin/com/github/waveformplotter/PlotDebuggerVariableAction.kt
+@@ -0,0 +1,22 @@
++package com.github.waveformplotter
++
++import com.intellij.openapi.actionSystem.AnActionEvent
++import com.intellij.openapi.actionSystem.ActionUpdateThread
++import com.intellij.xdebugger.impl.ui.tree.actions.XDebuggerTreeActionBase
++import com.intellij.xdebugger.impl.ui.tree.nodes.XValueNodeImpl
++import javax.swing.SwingUtilities
++
++/** Uses the debugger's full expression, including parent members and indices. */
++class PlotDebuggerVariableAction : XDebuggerTreeActionBase() {
++    override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.EDT
++
++    override fun perform(node: XValueNodeImpl, nodeName: String, e: AnActionEvent) {
++        val project = e.project ?: return
++        node.calculateEvaluationExpression().onSuccess { expression ->
++            val text = expression?.expression?.trim().orEmpty()
++            if (text.isNotEmpty()) SwingUtilities.invokeLater {
++                WaveformToolWindowFactory.withPanel(project) { it.addVariableByName(text) }
++            }
++        }
++    }
++}
+--- /dev/null
++++ b/src/main/kotlin/com/github/waveformplotter/StreamingTimeWindow.kt
+@@ -0,0 +1,45 @@
++package com.github.waveformplotter
++
++/** A fixed-duration viewport that follows the latest acquired frame. */
++class StreamingTimeWindow(initialSeconds: Double = 10.0) {
++    data class Range(val startSeconds: Double, val endSeconds: Double)
++
++    var durationSeconds = bounded(initialSeconds)
++        private set
++    var followingLatest = true
++        private set
++    private var manualStart = 0.0
++
++    fun rangeAt(latestSeconds: Double): Range {
++        val start = if (followingLatest) latestSeconds - durationSeconds else manualStart
++        return Range(start, start + durationSeconds)
++    }
++
++    fun setDuration(seconds: Double) {
++        durationSeconds = bounded(seconds)
++    }
++
++    fun followLatest() {
++        followingLatest = true
++    }
++
++    fun panTo(startSeconds: Double) {
++        require(startSeconds.isFinite())
++        manualStart = startSeconds
++        followingLatest = false
++    }
++
++    fun zoomBy(factor: Double, anchorFraction: Double, latestSeconds: Double) {
++        require(factor.isFinite() && factor > 0)
++        val oldRange = rangeAt(latestSeconds)
++        val fraction = anchorFraction.coerceIn(0.0, 1.0)
++        val anchor = oldRange.startSeconds + fraction * durationSeconds
++        durationSeconds = bounded(durationSeconds * factor)
++        if (!followingLatest) manualStart = anchor - fraction * durationSeconds
++    }
++
++    private fun bounded(seconds: Double): Double {
++        require(seconds.isFinite() && seconds > 0)
++        return seconds.coerceIn(0.1, 3600.0)
++    }
++}
+--- a/src/main/kotlin/com/github/waveformplotter/WaveformConfigService.kt
++++ b/src/main/kotlin/com/github/waveformplotter/WaveformConfigService.kt
+@@ -17,6 +17,7 @@
+         var variableNames: MutableList<String> = mutableListOf(),
+         var trackedVariables: MutableList<String> = mutableListOf(),
+         var liveWatchFrequency: Int = 50,
++        var windowSeconds: Double = 10.0,
+         var telnetPort: Int = 4444,
+         var resolvedAddresses: MutableMap<String, String> = mutableMapOf(),
+         // RTT 设置
+--- a/src/main/kotlin/com/github/waveformplotter/WaveformPanel.kt
++++ b/src/main/kotlin/com/github/waveformplotter/WaveformPanel.kt
+@@ -58,6 +58,10 @@
+         toolTipText = "Sampling frequency (Hz) — Telnet mode only"
+     }
+     private val freqLabel = JLabel("Hz")
++    private val windowSpinner = JSpinner(SpinnerNumberModel(10.0, 0.1, 3600.0, 1.0)).apply {
++        preferredSize = Dimension(75, preferredSize.height)
++        toolTipText = "Show the latest N seconds; old data scrolls off the screen"
++    }
+ 
+     // 时域/频域切换按钮
+     private val timeModeBtn = JButton("Time").apply {
+@@ -101,6 +105,10 @@
+ 
+     private val log = Logger.getInstance(WaveformPanel::class.java)
+     private var hasActiveSession = false
++    private var restoringConfig = false
++    private var resolvingVariables = false
++    private var resolutionGeneration = 0
++    private var plotRequested = false
+ 
+     // Live Watch 按钮颜色
+     private val colorIdle = JBColor(Color(0x616161), Color(0xBDBDBD))
+@@ -128,6 +136,25 @@
+     }
+ 
+     private fun setupLiveWatchCallbacks() {
++        sessionListener.onSessionAttached = {
++            liveWatchService.stopLiveWatch()
++            liveWatchService.clearResolvedEntries()
++            liveWatchService.elfResolver.clear()
++            SwingUtilities.invokeLater {
++                resolutionGeneration++
++                resolvingVariables = false
++                plotRequested = false
++                collector.recording = false
++                clearAll()
++                liveWatchBtn.text = "\u25B6 Live"
++                liveWatchBtn.foreground = colorIdle
++                liveStatusLabel.text = ""
++                freqSpinner.isEnabled = !isRttMode()
++                dataSourceCombo.isEnabled = true
++                updateButtonStates()
++            }
++        }
++
+         // Debug 会话首次暂停：自动获取 ELF 路径并加载符号（静默/隐藏）
+         sessionListener.onSessionStarted = { session ->
+             autoLoadElfSymbols(session)
+@@ -135,14 +162,9 @@
+ 
+         // MCU 暂停时：如果 Live Watch 开启且有未解析的变量，自动解析
+         sessionListener.onSessionPaused = { session ->
+-            if (liveWatchService.isRunning.get()) {
+-                val unresolved = collector.trackedVariables.filter { name ->
+-                    liveWatchService.getResolvedEntries()[name] == null
+-                }
+-                if (unresolved.isNotEmpty()) {
+-                    liveWatchService.resolveVariables(session, unresolved) { count ->
+-                        log.info("Auto-resolved $count variables during pause")
+-                    }
++            SwingUtilities.invokeLater {
++                if (plotRequested && !isRttMode() && session === sessionListener.getCurrentSession()) {
++                    startLiveWatch()
+                 }
+             }
+         }
+@@ -179,6 +201,21 @@
+         controlBar.add(timeModeBtn)
+         controlBar.add(fftModeBtn)
+         controlBar.add(timeUnitBtn)
++        controlBar.add(JLabel("Window(s)"))
++        controlBar.add(windowSpinner)
++        windowSpinner.addChangeListener {
++            val seconds = (windowSpinner.value as Number).toDouble()
++            if (kotlin.math.abs(plotCanvas.windowSeconds - seconds) > 1e-9) {
++                plotCanvas.windowSeconds = seconds
++            }
++            saveConfig()
++        }
++        plotCanvas.onWindowSecondsChanged = { seconds ->
++            if (kotlin.math.abs((windowSpinner.value as Number).toDouble() - seconds) > 1e-9) {
++                windowSpinner.value = seconds
++            }
++            saveConfig()
++        }
+         updateModeButtons()
+ 
+         // --- Live Watch 控件 ---
+@@ -245,21 +282,27 @@
+         val name = varField.text.trim()
+         if (name.isEmpty()) return
+         if (channelCheckboxes.containsKey(name)) {
++            channelCheckboxes[name]?.isSelected = true
++            onChannelSelectionChanged(name, true)
+             varField.selectAll()
+             return
+         }
+ 
+         addChannelCheckbox(name, checked = true)
+         varField.text = ""
+-        saveConfig()
++        onChannelSelectionChanged(name, true)
+     }
+ 
+     /** 外部调用：添加变量到绘图器（从右键菜单等） */
+     fun addVariableByName(name: String) {
+         val trimmed = name.trim()
+-        if (trimmed.isEmpty() || channelCheckboxes.containsKey(trimmed)) return
+-        addChannelCheckbox(trimmed, checked = true)
+-        saveConfig()
++        if (trimmed.isEmpty()) return
++        if (channelCheckboxes.containsKey(trimmed)) {
++            channelCheckboxes[trimmed]?.isSelected = true
++        } else {
++            addChannelCheckbox(trimmed, checked = true)
++        }
++        onChannelSelectionChanged(trimmed, true)
+     }
+ 
+     private fun addChannelCheckbox(name: String, checked: Boolean) {
+@@ -272,11 +315,18 @@
+         val channel = dataBuffer.getChannels().find { it.name == name } ?: return
+         val color = channel.color
+ 
+-        val cb = JCheckBox(name).apply {
++        val cb = JCheckBox().apply {
++            this.name = name
+             isSelected = checked
+             foreground = color
+             font = Font("Monospaced", Font.BOLD, 12)
+-            toolTipText = "Right-click to remove"
++            toolTipText = "Click to plot/hide; right-click to remove"
++        }
++        val nameLabel = JLabel(name).apply {
++            foreground = color
++            font = Font("Monospaced", Font.BOLD, 12)
++            cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
++            toolTipText = "Click variable name to start plotting; uncheck to hide"
+         }
+ 
+         // 实时数值标签
+@@ -286,13 +336,18 @@
+         }
+ 
+         cb.addActionListener {
+-            if (cb.isSelected) {
+-                collector.trackedVariables.add(name)
+-            } else {
+-                collector.trackedVariables.remove(name)
+-            }
+-            saveConfig()
+-        }
++            onChannelSelectionChanged(name, cb.isSelected)
++        }
++        val plotOnClick = object : java.awt.event.MouseAdapter() {
++            override fun mouseClicked(e: java.awt.event.MouseEvent) {
++                if (e.button == java.awt.event.MouseEvent.BUTTON1) {
++                    cb.isSelected = true
++                    onChannelSelectionChanged(name, true)
++                }
++            }
++        }
++        nameLabel.addMouseListener(plotOnClick)
++        valueLabel.addMouseListener(plotOnClick)
+         // 右键删除
+         val rightClickListener = object : java.awt.event.MouseAdapter() {
+             override fun mouseClicked(e: java.awt.event.MouseEvent) {
+@@ -302,11 +357,14 @@
+             }
+         }
+         cb.addMouseListener(rightClickListener)
++        nameLabel.addMouseListener(rightClickListener)
+         valueLabel.addMouseListener(rightClickListener)
+ 
+         if (checked) {
+             collector.trackedVariables.add(name)
+         }
++        dataBuffer.setChannelVisible(name, checked)
++        liveWatchService.setTrackedVariables(collector.trackedVariables)
+ 
+         channelCheckboxes[name] = cb
+         channelValueLabels[name] = valueLabel
+@@ -315,6 +373,7 @@
+         val itemPanel = JPanel(FlowLayout(FlowLayout.LEFT, 0, 0)).apply {
+             isOpaque = false
+             add(cb)
++            add(nameLabel)
+             add(valueLabel)
+         }
+         channelCheckPanel.add(itemPanel)
+@@ -322,8 +381,26 @@
+         channelCheckPanel.repaint()
+     }
+ 
++    private fun onChannelSelectionChanged(name: String, selected: Boolean) {
++        if (selected) collector.trackedVariables.add(name) else collector.trackedVariables.remove(name)
++        dataBuffer.setChannelVisible(name, selected)
++        liveWatchService.setTrackedVariables(collector.trackedVariables)
++        if (!selected) channelValueLabels[name]?.text = ""
++        plotCanvas.repaint()
++        saveConfig()
++        if (restoringConfig || isRttMode()) return
++        if (collector.trackedVariables.isEmpty()) {
++            stopLiveWatch()
++        } else if (selected && hasActiveSession) {
++            plotRequested = true
++            startLiveWatch()
++        }
++    }
++
+     private fun removeVariable(name: String) {
+         collector.trackedVariables.remove(name)
++        liveWatchService.setTrackedVariables(collector.trackedVariables)
++        liveWatchService.removeVariable(name)
+         dataBuffer.removeChannel(name)
+         channelCheckboxes.remove(name)
+         channelValueLabels.remove(name)
+@@ -331,7 +408,7 @@
+         val components = channelCheckPanel.components.toList()
+         for (comp in components) {
+             if (comp is JPanel) {
+-                val hasTarget = comp.components.any { it is JCheckBox && it.text == name }
++                val hasTarget = comp.components.any { it is JCheckBox && it.name == name }
+                 if (hasTarget) {
+                     channelCheckPanel.remove(comp)
+                     break
+@@ -340,6 +417,7 @@
+         }
+         channelCheckPanel.revalidate()
+         channelCheckPanel.repaint()
++        if (collector.trackedVariables.isEmpty() && !isRttMode()) stopLiveWatch()
+         saveConfig()
+     }
+ 
+@@ -391,6 +469,8 @@
+     // ── Telnet 模式 ──
+ 
+     private fun startLiveWatch() {
++        plotRequested = true
++        if (resolvingVariables) return
+         val session = sessionListener.getCurrentSession()
+         if (session == null) {
+             liveWatchBtn.foreground = colorError
+@@ -400,6 +480,7 @@
+         }
+ 
+         val trackedVars = collector.trackedVariables.toList()
++        liveWatchService.setTrackedVariables(trackedVars)
+         if (trackedVars.isEmpty()) {
+             liveStatusLabel.text = "No variables selected  "
+             liveStatusLabel.foreground = colorError
+@@ -409,11 +490,6 @@
+         val freq = freqSpinner.value as Int
+         val config = WaveformConfigService.getInstance(project)
+         val port = config.state.telnetPort
+-
+-        liveWatchBtn.text = "\u23F3 Resolving..."
+-        liveWatchBtn.isEnabled = false
+-        liveStatusLabel.text = "Resolving addresses...  "
+-        liveStatusLabel.foreground = colorIdle
+ 
+         // 1. 先尝试 ELF 符号表解析（无需暂停 MCU）
+         val elfResolved = if (liveWatchService.elfResolver.isLoaded()) {
+@@ -429,10 +505,27 @@
+             log.info("All ${trackedVars.size} variables resolved via ELF (no pause needed)")
+             launchLiveWatch(port, freq)
+         } else {
++            if (!session.isSuspended) {
++                liveStatusLabel.text = "Pause MCU once to resolve selected variables  "
++                liveStatusLabel.foreground = colorError
++                return
++            }
++            resolvingVariables = true
++            val generation = ++resolutionGeneration
++            liveWatchBtn.text = "\u23F3 Resolving..."
++            liveWatchBtn.isEnabled = false
++            liveStatusLabel.text = "Resolving addresses...  "
++            liveStatusLabel.foreground = colorIdle
+             log.info("$elfResolved resolved via ELF, ${unresolvedVars.size} need GDB fallback")
+-            liveWatchService.resolveVariables(session, unresolvedVars) { gdbResolved ->
++            liveWatchService.resolveVariables(session, unresolvedVars) { _ ->
+                 SwingUtilities.invokeLater {
+-                    val total = elfResolved + gdbResolved
++                    if (generation != resolutionGeneration || session !== sessionListener.getCurrentSession()) return@invokeLater
++                    resolvingVariables = false
++                    if (collector.trackedVariables.toSet() != trackedVars.toSet()) {
++                        startLiveWatch()
++                        return@invokeLater
++                    }
++                    val total = trackedVars.count { liveWatchService.getResolvedEntries()[it] != null }
+                     if (total == 0) {
+                         liveWatchBtn.text = "\u25B6 Live"
+                         liveWatchBtn.isEnabled = true
+@@ -448,6 +541,7 @@
+     }
+ 
+     private fun launchLiveWatch(port: Int, freq: Int) {
++        liveWatchService.setTrackedVariables(collector.trackedVariables)
+         liveWatchService.startLiveWatch(port, freq)
+ 
+         if (liveWatchService.lastError != null) {
+@@ -468,12 +562,16 @@
+     }
+ 
+     private fun stopLiveWatch() {
++        plotRequested = false
++        resolutionGeneration++
++        resolvingVariables = false
+         liveWatchService.stopLiveWatch()
+         liveWatchBtn.text = "\u25B6 Live"
+         liveWatchBtn.foreground = colorIdle
+         freqSpinner.isEnabled = true
+         dataSourceCombo.isEnabled = true
+         liveStatusLabel.text = ""
++        updateButtonStates()
+     }
+ 
+     // ── RTT 模式 ──
+@@ -595,7 +693,8 @@
+     private fun clearAll() {
+         dataBuffer.clearAll()
+         collector.resetSampleCount()
+-        liveWatchService.clearResolvedEntries()
++        // Clearing the chart must not discard addresses while Live is running.
++        channelValueLabels.values.forEach { it.text = "" }
+         plotCanvas.resetView()
+         plotCanvas.repaint()
+         updateStatusBar()
+@@ -654,7 +753,7 @@
+         else
+             JBColor(Color(0xB71C1C), Color(0xEF9A9A))
+ 
+-        if (!active && liveWatchService.isRunning.get()) {
++        if (!active && (liveWatchService.isRunning.get() || resolvingVariables || plotRequested)) {
+             stopLiveWatch()
+         }
+         // RTT 不依赖 debug session，不停止
+@@ -667,6 +766,10 @@
+     private fun updateChannelValues() {
+         val entries = liveWatchService.getResolvedEntries()
+         for ((name, label) in channelValueLabels) {
++            if (channelCheckboxes[name]?.isSelected != true) {
++                label.text = ""
++                continue
++            }
+             val ch = dataBuffer.getChannels().find { it.name == name }
+             if (ch != null && ch.size > 0) {
+                 val lastValue = ch.get(ch.size - 1)
+@@ -692,11 +795,13 @@
+     }
+ 
+     private fun saveConfig() {
++        if (restoringConfig) return
+         val config = WaveformConfigService.getInstance(project)
+         val s = config.state
+         s.variableNames = channelCheckboxes.keys.toMutableList()
+         s.trackedVariables = collector.trackedVariables.toMutableList()
+         s.liveWatchFrequency = freqSpinner.value as Int
++        s.windowSeconds = plotCanvas.windowSeconds
+         s.dataSource = dataSourceCombo.selectedItem as String
+         s.fontSize = plotCanvas.fontSize
+         s.lineWidth = plotCanvas.lineWidth
+@@ -704,21 +809,28 @@
+     }
+ 
+     private fun restoreConfig() {
+-        val config = WaveformConfigService.getInstance(project)
+-        val s = config.state
+-        val tracked = s.trackedVariables.toSet()
+-        for (name in s.variableNames) {
+-            addChannelCheckbox(name, checked = tracked.contains(name))
+-        }
+-        freqSpinner.value = s.liveWatchFrequency.coerceIn(1, 2000)
+-        dataSourceCombo.selectedItem = s.dataSource
+-        onDataSourceChanged()
+-        // 恢复 UI 设置
+-        plotCanvas.fontSize = s.fontSize.coerceIn(8, 20)
+-        plotCanvas.lineWidth = s.lineWidth.coerceIn(0.5f, 5.0f)
+-        plotCanvas.refreshIntervalMs = if (s.refreshFps >= 60) 16 else 33
+-        plotCanvas.updateFonts()
+-        plotCanvas.updateRefreshRate()
++        restoringConfig = true
++        try {
++            val config = WaveformConfigService.getInstance(project)
++            val s = config.state
++            val tracked = s.trackedVariables.toSet()
++            for (name in s.variableNames) {
++                addChannelCheckbox(name, checked = tracked.contains(name))
++            }
++            freqSpinner.value = s.liveWatchFrequency.coerceIn(1, 2000)
++            val seconds = if (s.windowSeconds.isFinite()) s.windowSeconds.coerceIn(0.1, 3600.0) else 10.0
++            windowSpinner.value = seconds
++            plotCanvas.windowSeconds = seconds
++            dataSourceCombo.selectedItem = s.dataSource
++            onDataSourceChanged()
++            plotCanvas.fontSize = s.fontSize.coerceIn(8, 20)
++            plotCanvas.lineWidth = s.lineWidth.coerceIn(0.5f, 5.0f)
++            plotCanvas.refreshIntervalMs = if (s.refreshFps >= 60) 16 else 33
++            plotCanvas.updateFonts()
++            plotCanvas.updateRefreshRate()
++        } finally {
++            restoringConfig = false
++        }
+     }
+ 
+     private fun csvField(s: String): String {
+--- a/src/main/kotlin/com/github/waveformplotter/WaveformToolWindowFactory.kt
++++ b/src/main/kotlin/com/github/waveformplotter/WaveformToolWindowFactory.kt
+@@ -21,6 +21,14 @@
+     companion object {
+         val PANEL_KEY = com.intellij.openapi.util.Key.create<WaveformPanel>("WaveformPlotter.Panel")
+ 
++        fun withPanel(project: Project, action: (WaveformPanel) -> Unit) {
++            project.getUserData(PANEL_KEY)?.let { action(it); return }
++            val toolWindow = ToolWindowManager.getInstance(project).getToolWindow("Waveform Plotter") ?: return
++            toolWindow.activate {
++                project.getUserData(PANEL_KEY)?.let(action)
++            }
++        }
++
+         /** 获取当前 project 的 WaveformPanel（如果面板未打开则先激活） */
+         fun getPanel(project: Project): WaveformPanel? {
+             // 先尝试已缓存的
+--- a/src/main/resources/META-INF/plugin.xml
++++ b/src/main/resources/META-INF/plugin.xml
+@@ -64,6 +64,12 @@
+     </extensions>
+ 
+     <actions>
++        <action id="WaveformPlotter.PlotDebuggerVariable"
++                class="com.github.waveformplotter.PlotDebuggerVariableAction"
++                text="Plot Variable / 绘制变量"
++                description="Plot the selected debugger variable in a streaming window">
++            <add-to-group group-id="XDebugger.ValueGroup" anchor="last"/>
++        </action>
+         <action id="WaveformPlotter.AddToPlotter"
+                 class="com.github.waveformplotter.AddToPlotterAction"
+                 text="Add to Waveform Plotter"

@@ -1,0 +1,79 @@
+--- a/src/main/kotlin/com/github/waveformplotter/DataBuffer.kt
++++ b/src/main/kotlin/com/github/waveformplotter/DataBuffer.kt
+@@ -67,6 +67,9 @@
+             if (channels.any { it.name == name }) return null
+             val color = COLORS[channels.size % COLORS.size]
+             val ch = ChannelData(name, color)
++            // A late channel has no values for existing frames. Keep its indices
++            // aligned with the shared timestamp ring instead of shifting it left.
++            repeat(tsSize) { ch.push(Double.NaN) }
+             channels.add(ch)
+             return ch
+         }
+@@ -85,8 +88,9 @@
+             tsHead = (tsHead + 1) % timestamps.size
+             if (tsSize < timestamps.size) tsSize++
+             for (ch in channels) {
+-                val v = values[ch.name]
+-                if (v != null) ch.push(v)
++                // Every channel advances once per frame, including failed reads
++                // and channels that are not included in this sample.
++                ch.push(values[ch.name] ?: Double.NaN)
+             }
+             version++
+         }
+--- a/src/main/kotlin/com/github/waveformplotter/DebugSessionListener.kt
++++ b/src/main/kotlin/com/github/waveformplotter/DebugSessionListener.kt
+@@ -24,6 +24,9 @@
+     private var currentSession: XDebugSession? = null
+     private var sessionListener: XDebugSessionListener? = null
+     private var busConnection: MessageBusConnection? = null
++
++    /** Called before a new session can populate cached addresses or samples. */
++    var onSessionAttached: (() -> Unit)? = null
+ 
+     /** Debug 会话启动时回调（首次暂停，用于 ELF 解析等初始化） */
+     var onSessionStarted: ((XDebugSession) -> Unit)? = null
+@@ -69,6 +72,7 @@
+ 
+     private fun attachToSession(session: XDebugSession) {
+         detachFromSession()
++        onSessionAttached?.invoke()
+         currentSession = session
+ 
+         firstPause = true
+--- a/src/main/kotlin/com/github/waveformplotter/WaveformPanel.kt
++++ b/src/main/kotlin/com/github/waveformplotter/WaveformPanel.kt
+@@ -128,6 +128,22 @@
+     }
+ 
+     private fun setupLiveWatchCallbacks() {
++        sessionListener.onSessionAttached = {
++            liveWatchService.stopLiveWatch()
++            liveWatchService.clearResolvedEntries()
++            liveWatchService.elfResolver.clear()
++            SwingUtilities.invokeLater {
++                collector.recording = false
++                clearAll()
++                liveWatchBtn.text = "\u25B6 Live"
++                liveWatchBtn.foreground = colorIdle
++                liveStatusLabel.text = ""
++                freqSpinner.isEnabled = !isRttMode()
++                dataSourceCombo.isEnabled = true
++                updateButtonStates()
++            }
++        }
++
+         // Debug 会话首次暂停：自动获取 ELF 路径并加载符号（静默/隐藏）
+         sessionListener.onSessionStarted = { session ->
+             autoLoadElfSymbols(session)
+@@ -595,7 +611,8 @@
+     private fun clearAll() {
+         dataBuffer.clearAll()
+         collector.resetSampleCount()
+-        liveWatchService.clearResolvedEntries()
++        // Clearing the chart must not discard addresses while Live is running.
++        channelValueLabels.values.forEach { it.text = "" }
+         plotCanvas.resetView()
+         plotCanvas.repaint()
+         updateStatusBar()

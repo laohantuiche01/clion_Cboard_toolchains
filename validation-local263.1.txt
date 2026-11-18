@@ -1,0 +1,4 @@
+PASS: actual CLion 263 compatibility checker: incompatible=false
+PASS: linked 36 plugin classes against installed IDE libraries
+
+PASS: late channel, missing samples, ring wrap, and clear/restart alignment
